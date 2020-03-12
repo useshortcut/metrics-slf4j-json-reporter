@@ -4,14 +4,17 @@
 package io.clubhouse.metrics;
 
 import com.codahale.metrics.*;
+import com.codahale.metrics.Timer;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.Marker;
 
-import java.util.Collections;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Set;
-import java.util.SortedMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -39,6 +42,9 @@ import static com.codahale.metrics.MetricAttribute.STDDEV;
  * for the bound logging toolkit to further process metrics reports.
  */
 public class Slf4jJsonReporter extends ScheduledReporter {
+    private final JsonNode requiredJsonNode;
+    private final ObjectMapper mapper;
+
     /**
      * Returns a new {@link Builder} for {@link Slf4jJsonReporter}.
      *
@@ -57,7 +63,9 @@ public class Slf4jJsonReporter extends ScheduledReporter {
      * not filtering metrics.
      */
     public static class Builder {
+        private final ObjectMapper mapper;
         private final MetricRegistry registry;
+        private JsonNode requiredJsonNode;
         private Logger logger;
         private LoggingLevel loggingLevel;
         private Marker marker;
@@ -70,6 +78,8 @@ public class Slf4jJsonReporter extends ScheduledReporter {
         private Set<MetricAttribute> disabledMetricAttributes;
 
         private Builder(MetricRegistry registry) {
+            this.mapper = new ObjectMapper();
+            this.requiredJsonNode = null;
             this.registry = registry;
             this.logger = LoggerFactory.getLogger("metrics");
             this.marker = null;
@@ -81,6 +91,16 @@ public class Slf4jJsonReporter extends ScheduledReporter {
             this.executor = null;
             this.shutdownExecutorOnStop = true;
             this.disabledMetricAttributes = Collections.emptySet();
+        }
+
+        /**
+         * A JSON object of string keys to string values is supported as the base JSON value for all log messages.
+         * @param jsonSource
+         * @throws JsonProcessingException
+         */
+        public Builder setRequiredJsonObject(String jsonSource) throws JsonProcessingException {
+            this.requiredJsonNode = mapper.readTree(jsonSource);
+            return this;
         }
 
         /**
@@ -223,7 +243,7 @@ public class Slf4jJsonReporter extends ScheduledReporter {
                     loggerProxy = new DebugLoggerProxy(logger);
                     break;
             }
-            return new Slf4jJsonReporter(registry, loggerProxy, marker, prefix, rateUnit, durationUnit, filter, executor,
+            return new Slf4jJsonReporter(registry, loggerProxy, requiredJsonNode, marker, prefix, rateUnit, durationUnit, filter, executor,
                     shutdownExecutorOnStop, disabledMetricAttributes);
         }
     }
@@ -233,18 +253,20 @@ public class Slf4jJsonReporter extends ScheduledReporter {
     private final String prefix;
 
     private Slf4jJsonReporter(MetricRegistry registry,
-                          LoggerProxy loggerProxy,
-                          Marker marker,
-                          String prefix,
-                          TimeUnit rateUnit,
-                          TimeUnit durationUnit,
-                          MetricFilter filter,
-                          ScheduledExecutorService executor,
-                          boolean shutdownExecutorOnStop,
-                          Set<MetricAttribute> disabledMetricAttributes) {
+                              LoggerProxy loggerProxy,
+                              JsonNode requiredJsonNode, Marker marker,
+                              String prefix,
+                              TimeUnit rateUnit,
+                              TimeUnit durationUnit,
+                              MetricFilter filter,
+                              ScheduledExecutorService executor,
+                              boolean shutdownExecutorOnStop,
+                              Set<MetricAttribute> disabledMetricAttributes) {
         super(registry, "logger-reporter", filter, rateUnit, durationUnit, executor, shutdownExecutorOnStop,
                 disabledMetricAttributes);
         this.loggerProxy = loggerProxy;
+        this.mapper = new ObjectMapper();
+        this.requiredJsonNode = requiredJsonNode;
         this.marker = marker;
         this.prefix = prefix;
     }
@@ -283,8 +305,8 @@ public class Slf4jJsonReporter extends ScheduledReporter {
     private void logTimer(StringBuilder b, String name, Timer timer) {
         final Snapshot snapshot = timer.getSnapshot();
         b.setLength(0);
-        b.append("{\"type\":\"TIMER\"");
-        append(b, "name", prefix(name));
+        b.append("{\"tag\":\"metrics-timer\"");
+        append(b, "metric_name", prefix(name));
         appendCountIfEnabled(b, timer);
         appendLongDurationIfEnabled(b, MIN, snapshot::getMin);
         appendLongDurationIfEnabled(b, MAX, snapshot::getMax);
@@ -300,25 +322,25 @@ public class Slf4jJsonReporter extends ScheduledReporter {
         append(b, "rate_unit", getRateUnit());
         append(b, "duration_unit", getDurationUnit());
         b.append('}');
-        loggerProxy.log(marker, b.toString());
+        loggerProxy.log(marker, mergeJson(b.toString()));
     }
 
     private void logMeter(StringBuilder b, String name, Meter meter) {
         b.setLength(0);
-        b.append("{\"type\":\"METER\"");
-        append(b, "name", prefix(name));
+        b.append("{\"tag\":\"metrics-meter\"");
+        append(b, "metric_name", prefix(name));
         appendCountIfEnabled(b, meter);
         appendMetered(b, meter);
         append(b, "rate_unit", getRateUnit());
         b.append('}');
-        loggerProxy.log(marker, b.toString());
+        loggerProxy.log(marker, mergeJson(b.toString()));
     }
 
     private void logHistogram(StringBuilder b, String name, Histogram histogram) {
         final Snapshot snapshot = histogram.getSnapshot();
         b.setLength(0);
-        b.append("{\"type\":\"HISTOGRAM\"");
-        append(b, "name", prefix(name));
+        b.append("{\"tag\":\"metrics-histogram\"");
+        append(b, "metric_name", prefix(name));
         appendCountIfEnabled(b, histogram);
         appendLongIfEnabled(b, MIN, snapshot::getMin);
         appendLongIfEnabled(b, MAX, snapshot::getMax);
@@ -331,25 +353,25 @@ public class Slf4jJsonReporter extends ScheduledReporter {
         appendDoubleIfEnabled(b, P99, snapshot::get99thPercentile);
         appendDoubleIfEnabled(b, P999, snapshot::get999thPercentile);
         b.append('}');
-        loggerProxy.log(marker, b.toString());
+        loggerProxy.log(marker, mergeJson(b.toString()));
     }
 
     private void logCounter(StringBuilder b, String name, Counter counter) {
         b.setLength(0);
-        b.append("{\"type\":\"COUNTER\"");
-        append(b, "name", prefix(name));
+        b.append("{\"tag\":\"metrics-counter\"");
+        append(b, "metric_name", prefix(name));
         append(b, COUNT.getCode(), counter.getCount());
         b.append('}');
-        loggerProxy.log(marker, b.toString());
+        loggerProxy.log(marker, mergeJson(b.toString()));
     }
 
     private void logGauge(StringBuilder b, String name, Gauge<?> gauge) {
         b.setLength(0);
-        b.append("{\"type\":\"GAUGE\"");
-        append(b, "name", prefix(name));
+        b.append("{\"tag\":\"metrics-gauge\"");
+        append(b, "metric_name", prefix(name));
         append(b, "value", gauge.getValue());
         b.append('}');
-        loggerProxy.log(marker, b.toString());
+        loggerProxy.log(marker, mergeJson(b.toString()));
     }
 
     private void appendLongDurationIfEnabled(StringBuilder b, MetricAttribute metricAttribute,
@@ -537,4 +559,37 @@ public class Slf4jJsonReporter extends ScheduledReporter {
         }
     }
 
+    /**
+     * Merge the source JSON with the base JSON object, if it exists, returning JSON as a string.
+     * @param jsonSource
+     * @return
+     */
+    public String mergeJson(String jsonSource) {
+        try {
+            JsonNode jsonNode = mapper.readTree(jsonSource);
+            if (this.requiredJsonNode != null) {
+                for (Iterator<Entry<String, JsonNode>> it = this.requiredJsonNode.fields(); it.hasNext(); ) {
+                    Entry<String, JsonNode> entry = it.next();
+                    ((ObjectNode) jsonNode).put(entry.getKey(), entry.getValue().textValue());
+                }
+            }
+            return mapper.writeValueAsString(jsonNode);
+        } catch (JsonProcessingException e) {
+            // Since the reporting methods do not support throwing an exception,
+            // try to return something meaningful.
+            if (this.requiredJsonNode != null) {
+                JsonNode returnJson = this.requiredJsonNode.deepCopy();
+                ((ObjectNode) returnJson).put("metric_error", "JsonProcessingException: " + e.getMessage());
+                try {
+                    return mapper.writeValueAsString(returnJson);
+                } catch (JsonProcessingException ex) {
+                    // (Daniel) This should be impossible to reach because we throw an exception when the
+                    // requiredJsonNode is set if it's not legal JSON, but checked exceptions FTW.
+                    loggerProxy.logger.error("Failed to produce metrics JSON.", ex);
+                }
+            }
+        }
+        // If all else fails, return what was passed in.
+        return jsonSource;
+    }
 }
